@@ -4,12 +4,18 @@
 
 # IMPORTAZIONI
 # il pacchetto sys ci consente di gestire gli argomenti da linea di comando, mentre il pacchetto os ci serve per intervenire sui file
-# il pacchetto dateutil.parser ci serve per maneggare le date
+# i pacchetti datetime e dateutil.parser ci servono per maneggare le date
 # il pacchetto sqlite3 ci serve per gestire il database sqlite dove vengono salvati i dati di lavoro dell'applicazione
+# i pacchetti yfinance e yfinance_cache servono a raccogliere i dati da Yahoo Finance (yfinance_cache ha più o meno le stesse funzionalità di yfinance ma dovrebbe utilizzare una cache locale in modo da ridurre i tempi di download)
+# il pacchetto pandas ci serve per gestire i dataset
 import sys
 import os
+import datetime
 import dateutil.parser
 import sqlite3
+import yfinance
+import yfinance_cache
+import pandas
 
 # funzione per la connessione al database
 def sqlite_connect():
@@ -30,13 +36,13 @@ def sqlite_init_db( db ):
     c = db.cursor()
     c.execute('''
         CREATE TABLE IF NOT EXISTS symbols
-        ([symbol] TEXT PRIMARY KEY, [position] TEXT)
+        ([symbol] TEXT PRIMARY KEY, [position] TEXT, [opened] TEXT, [price] NUMERIC)
         ''')
 
 # funzione per l'aggiunta di un simbolo al database
 def sqlite_add_symbol( db, symbol ):
     c = db.cursor()
-    sql = ''' INSERT INTO symbols VALUES( ?, ? ) '''
+    sql = ''' INSERT INTO symbols VALUES( ?, ?, ?, ? ) '''
     c.execute( sql, ( symbol, None ) )
     db.commit()
 
@@ -62,16 +68,76 @@ def is_date( string, fuzzy = False ):
     except ValueError:
         return False
 
+# funzione che decide cosa fare con un titolo
+def strategy_3ma( data, today ):
+
+    yesterday = today - datetime.timedelta( days = 1 )
+
+    interval = pandas.DataFrame( data )
+
+    close = interval[ 'Close' ]
+
+    sma10 = close.rolling( window = 10 ).mean()
+    sma20 = close.rolling( window = 20 ).mean()
+    sma30 = close.rolling( window = 30 ).mean()
+
+    price = close[ yesterday.strftime( '%Y-%m-%d' ) ]
+    sma10v = sma10[ yesterday.strftime( '%Y-%m-%d' ) ]
+    sma20v = sma20[ yesterday.strftime( '%Y-%m-%d' ) ]
+    sma30v = sma30[ yesterday.strftime( '%Y-%m-%d' ) ]
+
+    print( yesterday, '(ieri) prezzo di chiusura ->', close[ yesterday.strftime( '%Y-%m-%d' ) ], 'SMA 10 ->', sma10v, 'SMA 20 ->', sma20v, 'SMA 30 ->', sma30v )
+
+    if price > sma30v:
+        return 'LONG'
+    elif price <= sma30v:
+        return 'SHORT'
+
+# funzione che prende il prezzo corrente di un simbolo
+# NOTA questa funzione è in sviluppo, utilizzare solo per i test!
+def get_price( symbol, decision, date ):
+
+    # se la data è storica, prendo il valore storico
+    if date < datetime.date.today():
+        print( 'è stata richiesta una data storica' )
+        ticker = yfinance_cache.Ticker( symbol )
+        end = date + datetime.timedelta( days = 1 )
+        values = ticker.history( interval = '1d', start = date, end = end )
+        interval = pandas.DataFrame( values )
+        close = interval[ 'Close' ]
+        price = close[ date.strftime( '%Y-%m-%d' ) ]
+
+    else:
+        stock = yfinance.Ticker( symbol )
+        price = stock.info['regularMarketPrice']
+
+    print( 'il prezzo corrente per', symbol, 'al', date, 'è', price )
+
+    return price
+
+# funzione che apre una posizione
+def open_position( db, symbol, decision, today ):
+    price = get_price( symbol, decision, today )
+    print( 'apro', decision, 'per', symbol, 'a', price, 'dollari' )
+    # TODO scrivo nel database la decisione, la data e il prezzo
+
+# funzione che chiude una posizione
+def close_position( db, symbol, decision, today ):
+    price = get_price( symbol, decision, today )
+    print( 'chiudo', decision, 'per', symbol, 'a', price, 'dollari' )
+    # TODO leggo dal database la decisione, la data e il prezzo
+    # TODO scrivo il file di report dell'operazione
+    # TODO svuoto nel database la decisione, la data e il prezzo
+
 # INIZIO PROGRAMMA PRINCIPALE
 # la prima sezione del programma gestisce gli argomenti da linea di comando dati dall'utente per gestire il database (aggiunta, rimozione e visualizzazione dei simboli)
 # mentre la seconda parte fa i trade veri e propri
-
 if __name__ == '__main__':
 
     # apro il database
     db = sqlite_connect()
 
-    # se il programma è chiamato con degli argomenti...
+    # se il programma è chiamato con tre argomenti...
     if len( sys.argv ) == 3:
         if sys.argv[1] == 'reset' and sys.argv[2] == 'database':
             print( 'azzero il database' )
@@ -81,6 +147,7 @@ if __name__ == '__main__':
             for row in data:
                 print( row )
 
+    # se il programma è chiamato con due argomenti...
     elif len( sys.argv ) == 4:
         if sys.argv[1] == 'add' and sys.argv[2] == 'symbol':
             print( 'aggiungo il simbolo', sys.argv[3] )
@@ -90,6 +157,7 @@ if __name__ == '__main__':
             print( 'rimuovo il simbolo', sys.argv[3] )
             sqlite_remove_symbol( db, sys.argv[3] )
 
+    # funzionamento base del programma (un argomento o nessun argomento)
     else:
 
         # gestione linea di comando a singolo argomento
@@ -103,32 +171,84 @@ if __name__ == '__main__':
                 print( '<data> -> per lavorare su una data specifica anziché oggi' )
             elif is_date( sys.argv[1] ):
                 print( 'lavoro sulla data custom:', sys.argv[1] )
+                today = datetime.datetime.strptime( sys.argv[1], '%Y-%m-%d' ).date()
+            else:
+                today = datetime.date.today()
 
         # leggo la lista dei simboli
         data = sqlite_get_symbols( db )
 
         # elaborazione di ogni simbolo
         for symbol in data:
-            print( 'lavoro sul simbolo:', symbol['symbol'] )
+
+            # output
+            print( 'lavoro sul simbolo:', symbol['symbol'], 'per la data', today )
+
+            # data di inizio periodo storico dati
+            start = today - datetime.timedelta( days = 365 )
 
             # per ogni simbolo, scarico il dataset aggiornato
-            # NOTA questa cosa si può forse rendere più efficiente salvando nel database le porzioni storiche
-            # del dataset e scaricando solo gli ultimi due giorni (ieri e oggi)
+            ticker = yfinance_cache.Ticker( symbol['symbol'] )
+            values = ticker.history( interval = '1d', start = start, end = today )
 
             # chiamo la funzione di valtuazione per sapere se il segnale di oggi è LONG o SHORT
+            decision = strategy_3ma( values, today )
 
-            # leggo se ho una posizione aperta nel database
+            # output
+            print( 'la decisione è di andare', decision )
 
-            # se non ho una posizione aperta e il segnale è LONG apro LONG
+            # se non ho una posizione aperta
+            if symbol['position'] == None:
+                print( 'non ho una posizione aperta per', symbol['symbol'] )
 
-            # se ho una posizione aperta LONG e il segnale è LONG non faccio nulla
+                # se non ho una posizione aperta e il segnale è LONG apro LONG
+                if decision == 'LONG':
+                    print( 'apro una posizione', decision, 'per', symbol['symbol'] )
+                    open_position( db, symbol['symbol'], decision, today )
 
-            # se ho una posizione apert SHORT e il segnale è LONG chiudo la posizione SHORT e apro una posizione LONG
+                # se non ho una posizione aperta e il segnale è SHORT apro SHORT
+                elif decision == 'SHORT':
+                    print( 'apro una posizione', decision, 'per', symbol['symbol'] )
+                    open_position( db, symbol['symbol'], decision, today )
 
-            # se non ho una posizione aperta e il segnale è SHORT apro SHORT
+                # se c'è un segnale di indecisione
+                else:
+                    print( 'ho un segnale di indecizione e non apro una posizione per', symbol['symbol'] )
 
-            # se ho una posizione aperta LONG e il segnale è SHORT chiudo la posizione LONG e apro una posizione SHORT
+            # se ho una posizione aperta LONG
+            elif symbol['position'] == 'LONG':
 
-            # se ho una posizione aperta SHORT e il segnale è SHORT non faccio nulla
+                # se ho una posizione aperta LONG e il segnale è LONG non faccio nulla
+                if decision == 'LONG':
+                    print( 'mantengo la posizione', decision, 'per', symbol['symbol'] )
+
+                # se ho una posizione aperta LONG e il segnale è SHORT chiudo la posizione LONG e apro una posizione SHORT
+                elif decision == 'SHORT':
+                    print( 'chiudo la posizione', symbol['position'], 'per', symbol['symbol'] )
+                    close_position( db, symbol['symbol'], decision, today )
+                    print( 'apro una posizione', decision, 'per', symbol['symbol'] )
+                    open_position( db, symbol['symbol'], decision, today )
+
+                # se c'è un segnale di indecisione
+                else:
+                    print( 'ho un segnale di indecizione e non modifico la posizione', symbol['position'], 'per', symbol['symbol'] )
+
+            # se ho una posizione aperta SHORT
+            elif symbol['position'] == 'SHORT':
+
+                # se ho una posizione aperta SHORT e il segnale è LONG chiudo la posizione SHORT e apro una posizione LONG
+                if decision == 'LONG':
+                    print( 'chiudo la posizione', symbol['position'], 'per', symbol['symbol'] )
+                    close_position( db, symbol['symbol'], decision, today )
+                    print( 'apro una posizione', decision, 'per', symbol['symbol'] )
+                    open_position( db, symbol['symbol'], decision, today )
+
+                # se ho una posizione aperta SHORT e il segnale è SHORT non faccio nulla
+                elif decision == 'SHORT':
+                    print( 'mantengo la posizione', decision, 'per', symbol['symbol'] )
+
+                # se c'è un segnale di indecisione
+                else:
+                    print( 'ho un segnale di indecizione e non modifico la posizione', symbol['position'], 'per', symbol['symbol'] )
 
 
